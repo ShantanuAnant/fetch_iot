@@ -4,11 +4,14 @@ from PIL import Image
 import json
 import argparse
 import sys
+import concurrent.futures
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Download IoT notes and generate PDF.")
 parser.add_argument('--1', dest='chapter_1', action='store_true', help="Download Chapter 1")
 parser.add_argument('--2', dest='chapter_2', action='store_true', help="Download Chapter 2")
+parser.add_argument('-c', '--chapter', type=int, help="Specify chapter number (e.g., 1 or 2)")
+parser.add_argument('-w', '--workers', type=int, default=10, help="Number of parallel workers (default: 10)")
 
 args = parser.parse_args()
 
@@ -17,7 +20,8 @@ if args.chapter_1:
     chapter_num = 1
 elif args.chapter_2:
     chapter_num = 2
-
+elif args.chapter:
+    chapter_num = args.chapter
 else:
     print("Please specify a chapter using --1, --2, or --chapter <n>")
     sys.exit(1)
@@ -66,55 +70,80 @@ headers = {
     'sec-ch-ua-mobile': '?0',
 }
 
-downloaded_images = []
-
-print(f"Starting download of Chapter {chapter_num} ({end_page} pages)...")
-
-for i in range(start_page, end_page + 1):
-    url = url_template.format(i)
-    file_name = f"{i}.jpg"
+def download_page(page_num):
+    url = url_template.format(page_num)
+    file_name = f"{page_num}.jpg"
     file_path = os.path.join(output_dir, file_name)
     
-    print(f"Fetching page {i}: {url}")
-    
+    # Check if file already exists
+    if os.path.exists(file_path):
+        return file_path
+
+    print(f"Fetching page {page_num}...")
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             with open(file_path, "wb") as f:
                 f.write(response.content)
-            downloaded_images.append(file_path)
-            print(f"Saved {file_path}")
+            return file_path
         else:
-            print(f"Failed to fetch page {i}. Status code: {response.status_code}")
+            print(f"Failed to fetch page {page_num}. Status code: {response.status_code}")
+            return None
     except Exception as e:
-        print(f"Error fetching page {i}: {e}")
+        print(f"Error fetching page {page_num}: {e}")
+        return None
+
+downloaded_images = []
+
+print(f"Starting parallel download of Chapter {chapter_num} ({end_page} pages) with {args.workers} workers...")
+
+# Use ThreadPoolExecutor for parallel downloads
+with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+    # map returns results in the order of the iterable
+    results = executor.map(download_page, range(start_page, end_page + 1))
+    
+    # Collect successful downloads
+    for res in results:
+        if res:
+            downloaded_images.append(res)
 
 print("Download complete. Generating PDF...")
 
 if downloaded_images:
-    image_objects = []
     opened_images = [] # Keep track to close them later
     try:
-        # Open the first image
-        first_image_path = downloaded_images[0]
-        first_image = Image.open(first_image_path)
-        opened_images.append(first_image)
-        
-        if first_image.mode != 'RGB':
-            first_image = first_image.convert('RGB')
+        if not downloaded_images:
+             print("No images downloaded.")
+        else:
+            image_objects = []
             
-        # Open and process the rest of the images
-        for img_path in downloaded_images[1:]:
-            img = Image.open(img_path)
-            opened_images.append(img)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            image_objects.append(img)
-        
-        # Save as PDF
-        first_image.save(pdf_path, save_all=True, append_images=image_objects)
-        print(f"PDF generated successfully: {pdf_path}")
-        
+            # Open the first image
+            first_image_path = downloaded_images[0]
+            try:
+                first_image = Image.open(first_image_path)
+                opened_images.append(first_image)
+                
+                if first_image.mode != 'RGB':
+                    first_image = first_image.convert('RGB')
+                
+                # Open and process the rest of the images
+                for img_path in downloaded_images[1:]:
+                    try:
+                        img = Image.open(img_path)
+                        opened_images.append(img)
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        image_objects.append(img)
+                    except Exception as e:
+                        print(f"Warning: Could not open image {img_path}: {e}")
+
+                # Save as PDF
+                first_image.save(pdf_path, save_all=True, append_images=image_objects)
+                print(f"PDF generated successfully: {pdf_path}")
+                
+            except Exception as e:
+                 print(f"Error opening first image or saving PDF: {e}")
+
     except Exception as e:
         print(f"Error generating PDF: {e}")
     finally:
